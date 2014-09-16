@@ -22,13 +22,20 @@ let move_hash src dest =
   V.VarHash.clear dest;
   V.VarHash.iter (fun a b -> V.VarHash.add dest a b) src
 
-let fuzz_finish_reason = ref None
+let skip_strings =
+  (let h = Hashtbl.create 2 in
+     Hashtbl.replace h "NoOp" ();
+     Hashtbl.replace h "x86g_use_seg_selector" ();
+     h)
 
-let finish_fuzz s =
-  assert(!fuzz_finish_reason = None);
-  fuzz_finish_reason := Some s;
-  if !opt_trace_stopping then
-    Printf.printf "Final iteration, %s\n" s
+(* The interface for Vine to give us the disassembly of an instruction
+   is to put it in a comment, but it uses comments for other things as
+   well. So this code tries to filter out all the things that are not
+   instruction disassemblies. It would be cleaner to have a special
+   syntax. *)
+let comment_is_insn s =
+  (not (Hashtbl.mem skip_strings s))
+  && ((String.length s < 13) || (String.sub s 0 13) <> "eflags thunk:")
 
 class virtual special_handler = object(self)
   method virtual handle_special : string -> V.stmt list option
@@ -159,6 +166,9 @@ class virtual fragment_machine = object
   method virtual get_eip : int64
   method virtual set_eip : int64 -> unit
   method virtual run_eip_hooks : unit
+  method virtual get_esp : int64
+  method virtual jump_hook : string -> int64 -> int64 -> unit
+  method virtual run_jump_hooks : string -> int64 -> int64 -> unit
   
   method virtual set_cjmp_heuristic :
     (int64 -> int64 -> int64 -> float -> bool option -> bool option) -> unit
@@ -192,6 +202,10 @@ class virtual fragment_machine = object
   method virtual started_symbolic : bool
   method virtual maybe_start_symbolic : (unit -> unit) -> unit
   method virtual start_symbolic : unit
+
+  method virtual finish_fuzz : string -> unit
+  method virtual unfinish_fuzz : string -> unit
+  method virtual finish_reasons : string list
 
   method virtual make_snap : unit -> unit
   method virtual reset : unit -> unit
@@ -489,6 +503,79 @@ struct
 
     method run_eip_hooks =
       self#eip_hook (self#get_eip)
+
+    method get_esp =
+      match !opt_arch with
+	| X86 -> self#get_word_var R_ESP
+	| X64 -> self#get_word_var R_RSP
+	| ARM -> self#get_word_var R13
+
+    val mutable call_stack = []
+
+    method private trace_callstack last_insn last_eip eip =
+      let pop_callstack esp =
+	while match call_stack with
+	  | (old_esp, _, _, _) :: _ when old_esp < esp -> true
+	  | _ -> false do
+	      call_stack <- List.tl call_stack
+	done
+      in
+      let get_retaddr esp =
+	match !opt_arch with
+	  | X86 -> self#load_word_conc esp
+	  | X64 -> self#load_long_conc esp
+	  | ARM -> self#get_word_var R14
+      in
+      let size = match !opt_arch with
+	| X86 -> 4L
+	| X64 -> 8L
+	| ARM -> 4L
+      in
+      let kind =
+	match !opt_arch with
+	  | X86 | X64 ->
+	      let s = last_insn ^ "    " in
+		if (String.sub s 0 4) = "call" then
+		  "call"
+		else if (String.sub s 0 3) = "ret" then
+		  "return"
+		else if (String.sub s 0 3) = "jmp" then
+		  "unconditional jump"
+		else if (String.sub s 0 1) = "j" then
+		  "conditional jump"
+		else
+		  "not a jump"
+	  | ARM ->
+	      (* TODO: add similar parsing for ARM mnemonics *)
+	      "not a jump"
+      in
+	match kind with
+	  | "call" ->
+	      let esp = self#get_esp in
+	      let depth = List.length call_stack and
+		  ret_addr = get_retaddr esp
+	      in
+		for i = 0 to depth - 1 do Printf.printf " " done;
+		Printf.printf
+		  "Call from 0x%08Lx to 0x%08Lx (return to 0x%08Lx)\n"
+		  last_eip eip ret_addr;
+		call_stack <- (esp, last_eip, eip, ret_addr) :: call_stack;
+	  | "return" ->
+	      let esp = self#get_esp in
+		pop_callstack (Int64.sub esp size);
+		let depth = List.length call_stack in
+		  for i = 0 to depth - 2 do Printf.printf " " done;
+		  Printf.printf "Return from 0x%08Lx to 0x%08Lx\n"
+		    last_eip eip;
+		  pop_callstack esp;
+	  | _ -> ()
+
+    method jump_hook last_insn last_eip eip =
+      if !opt_trace_callstack then
+	self#trace_callstack last_insn last_eip eip
+
+    method run_jump_hooks last_insn last_eip eip =
+      self#jump_hook last_insn last_eip eip
 
     method set_cjmp_heuristic
       (func:(int64 -> int64 -> int64 -> float -> bool option -> bool option))
@@ -1047,11 +1134,26 @@ struct
       snap <- (V.VarHash.copy reg_store, V.VarHash.copy temps);
       List.iter (fun h -> h#make_snap) special_handler_list
 
+    val mutable fuzz_finish_reasons = []
+
+    method finish_fuzz s =
+      fuzz_finish_reasons <- s :: fuzz_finish_reasons;
+      if !opt_trace_stopping then
+	Printf.printf "Final iteration, %s\n" s
+
+    method unfinish_fuzz s =
+      if !opt_trace_stopping then
+	Printf.printf "Non-finish condition %s\n" s
+
+    method finish_reasons =
+      fuzz_finish_reasons
+
     method reset () =
       mem#reset ();
       (match snap with (r, t) ->
 	 move_hash r reg_store;
 	 move_hash t temps);
+      fuzz_finish_reasons <- [];
       List.iter (fun h -> h#reset) special_handler_list
 
     method add_special_handler (h:special_handler) =
@@ -1392,6 +1494,18 @@ struct
       in
 	((func v1), ty)
 
+    method private eval_ite v_c v_t v_f ty_t =
+      let func =
+	match ty_t with
+	  | V.REG_1  -> D.ite1
+	  | V.REG_8  -> D.ite8
+	  | V.REG_16 -> D.ite16
+	  | V.REG_32 -> D.ite32
+	  | V.REG_64 -> D.ite64
+	  | _ -> failwith "unexpeceted type in eval_ite"
+      in
+	((func v_c v_t v_f), ty_t)
+
     method eval_int_exp_ty exp =
       match exp with
 	| V.BinOp(op, e1, e2) ->
@@ -1416,9 +1530,21 @@ struct
 	| V.Cast(kind, ty, e) ->
 	    let (v1, ty1) = self#eval_int_exp_ty e in
 	      self#eval_cast kind ty v1 ty1
-		(* XXX move this to something like a special handler: *)
+	| V.Ite(cond, true_e, false_e) ->
+	    let (v_c, ty_c) = self#eval_int_exp_ty cond and
+		(v_t, ty_t) = self#eval_int_exp_ty true_e and
+		(v_f, ty_f) = self#eval_int_exp_ty false_e in
+	      assert(ty_c = V.REG_1);
+	      assert(ty_t = ty_f);
+	      self#eval_ite v_c v_t v_f ty_t
+	(* XXX move this to something like a special handler: *)
 	| V.Unknown("rdtsc") -> ((D.from_concrete_64 1L), V.REG_64) 
-	| _ -> failwith "Unsupported (or non-int) expr type in eval_int_exp_ty"
+	| V.Unknown(_) ->
+	    failwith "Unsupported unknown in eval_int_exp_ty"
+	| V.Let(_,_,_)
+	| V.Name(_)
+	| V.Constant(V.Str(_))
+	  -> failwith "Unsupported (or non-int) expr type in eval_int_exp_ty"
 	    
     method private eval_int_exp exp =
       let (v, _) = self#eval_int_exp_ty exp in
@@ -1466,8 +1592,13 @@ struct
 	    | Some sl ->
 		self#run_sl do_jump sl
 
+    val mutable last_eip = -1L
+    val mutable last_insn = "none"
+    val mutable saw_jump = false
+
     method run_sl do_jump sl =
       let jump lab =
+	saw_jump <- true;
 	if do_jump lab then
 	  self#jump do_jump lab
 	else
@@ -1519,20 +1650,24 @@ struct
 			   (String.sub l 0 5) = "pc_0x") then
 		       (let eip = Vine.label_to_addr l in
 			  self#set_eip eip;
-			  self#run_eip_hooks);
+			  (* saw_jump will be set for the fallthrough
+			     from one instruction to the next unless it's
+			     optimized away (which it won't be when we
+			     translate one instruction at a time), so it's
+			     an overapproximation. *)
+			  if saw_jump then
+			    self#run_jump_hooks last_insn last_eip eip;
+			  self#run_eip_hooks;
+			  last_eip <- eip;
+			  saw_jump <- false);
 		     loop rest
 		 | V.ExpStmt(e) ->
 		     let v = self#eval_int_exp e in
 		       ignore(v);
 		       loop rest
-		 | V.Comment(s) -> 
-		     if (!opt_print_callrets) then (
-		       if (Str.string_match
-			     (Str.regexp ".*\\(call\\|ret\\).*") s 0) then (
-			 let eip = self#get_eip in
-			   Printf.printf "%s @ 0x%Lx\n" s eip
-		       );
-		     );
+		 | V.Comment(s) ->
+		     if comment_is_insn s then
+		       last_insn <- s;
 		     loop rest
 		 | V.Block(_,_) -> failwith "Block unsupported"
 		 | V.Function(_,_,_,_,_) -> failwith "Function unsupported"
@@ -1729,6 +1864,8 @@ struct
 	      (D.from_concrete_16 (Int64.to_int i)),V.REG_16
 	  | V.Constant(V.Int(V.REG_32,i)) -> (D.from_concrete_32 i),V.REG_32
 	  | V.Constant(V.Int(V.REG_64,i)) -> (D.from_concrete_64 i),V.REG_64
+	  | V.Constant(V.Int(_, _)) ->
+	      failwith "Unhandled weird-typed integer constant in concolic_exp"
 	  | V.BinOp(op, e1, e2) ->
 	      let (v1, ty1) = rw_loop e1 and
 		  (v2, ty2) = rw_loop e2 in
@@ -1739,7 +1876,16 @@ struct
 	  | V.Cast(kind, ty, e1) ->
 	      let (v1, ty1) = rw_loop e1 in
 		self#eval_cast kind ty v1 ty1
-	  | _ -> failwith "Unhandled expression type in concolic_exp"
+	  | V.Ite(ce, te, fe) ->
+	    let (v_c, ty_c) = rw_loop ce and
+		(v_t, ty_t) = rw_loop te and
+		(v_f, ty_f) = rw_loop fe in
+	      self#eval_ite v_c v_t v_f ty_t
+	  | V.Let(_, _, _)
+	  | V.Name(_)
+	  | V.Lval(_)
+	  | V.Constant(V.Str(_))
+	    -> failwith "Unhandled expression type in concolic_exp"
       in
 	rw_loop exp
 

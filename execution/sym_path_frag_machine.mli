@@ -81,6 +81,9 @@ sig
     method get_eip : int64
     method set_eip : int64 -> unit
     method run_eip_hooks : unit
+    method get_esp : int64
+    method jump_hook : string -> int64 -> int64 -> unit
+    method run_jump_hooks : string -> int64 -> int64 -> unit
     method on_missing_symbol : unit
     method private on_missing_zero_m :
       Granular_memory.GranularMemoryFunctor(D).granular_memory -> unit
@@ -115,6 +118,9 @@ sig
     method started_symbolic : bool
     method maybe_start_symbolic : (unit -> unit) -> unit
     method start_symbolic : unit
+    method finish_fuzz : string -> unit
+    method unfinish_fuzz : string -> unit
+    method finish_reasons : string list
     method make_snap : unit -> unit
     method add_special_handler : Fragment_machine.special_handler -> unit
     method handle_special : string -> Vine.stmt list option

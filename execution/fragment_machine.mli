@@ -42,8 +42,7 @@ type register_name =
 val reg_to_regstr : register_name -> string
 val regstr_to_reg : string -> register_name
 
-val fuzz_finish_reason : string option ref
-val finish_fuzz : string -> unit
+val comment_is_insn : string -> bool
 
 (* This virtual class is the outside interface to a fragment machine,
    hiding internal methods. It's also convenient that it hides the domain
@@ -58,6 +57,9 @@ class virtual fragment_machine : object
   method virtual get_eip : int64
   method virtual set_eip : int64 -> unit
   method virtual run_eip_hooks : unit
+  method virtual get_esp : int64
+  method virtual jump_hook : string -> int64 -> int64 -> unit
+  method virtual run_jump_hooks : string -> int64 -> int64 -> unit
   
   method virtual set_cjmp_heuristic :
     (int64 -> int64 -> int64 -> float -> bool option -> bool option) -> unit
@@ -91,6 +93,10 @@ class virtual fragment_machine : object
   method virtual started_symbolic : bool
   method virtual maybe_start_symbolic : (unit -> unit) -> unit
   method virtual start_symbolic : unit
+
+  method virtual finish_fuzz : string -> unit
+  method virtual unfinish_fuzz : string -> unit
+  method virtual finish_reasons : string list
 
   method virtual make_snap : unit -> unit
   method virtual reset : unit -> unit
@@ -242,6 +248,9 @@ sig
     method get_eip : int64
     method set_eip : int64 -> unit
     method run_eip_hooks : unit
+    method get_esp : int64
+    method jump_hook : string -> int64 -> int64 -> unit
+    method run_jump_hooks : string -> int64 -> int64 -> unit
 
     method set_cjmp_heuristic :
       (int64 -> int64 -> int64 -> float -> bool option -> bool option) -> unit
@@ -290,6 +299,10 @@ sig
     method started_symbolic : bool
     method maybe_start_symbolic : (unit -> unit) -> unit
     method start_symbolic : unit
+
+    method finish_fuzz : string -> unit
+    method unfinish_fuzz : string -> unit
+    method finish_reasons : string list
 
     method make_snap : unit -> unit
     method reset : unit -> unit

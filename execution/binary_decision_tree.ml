@@ -286,6 +286,7 @@ class binary_decision_tree = object(self)
   val mutable path_hash = Int64.to_int32 0x811c9dc5L
   val mutable iteration_count = 0
   val mutable randomness = Random.State.make [|!opt_random_seed; 0|]
+  val mutable best_heur = -1
   val mutable cur_heur = -1
 
   method init =
@@ -618,7 +619,12 @@ class binary_decision_tree = object(self)
       (* check the invariant that a node can only be marked all_seen
 	 if all of its children are. *)
       (match get_f_child n with
-	 | Some(Some kid) -> assert(kid.all_seen);
+	 | Some(Some kid) ->
+	     if not kid.all_seen then
+	       (Printf.printf "all_seen invariant failure: parent %d is all seen, but not true child %d%!\n"
+		  n.ident kid.ident;
+		self#print_tree stdout;
+		assert(kid.all_seen));
 	 | _ -> ());
       (match get_t_child n with
 	 | Some(Some kid) ->
@@ -708,6 +714,8 @@ class binary_decision_tree = object(self)
 
   method set_heur i =
     cur_heur <- i;
+    if i > best_heur then
+      best_heur <- i;
     self#propagate_heur cur
 
   method private propagate_heur node =
@@ -737,7 +745,21 @@ class binary_decision_tree = object(self)
 		"Heuristic choice between F[%d, %d] and T[%d, %d]\n"
 		f_min f_max t_min t_max;
 	    if f_min > f_max || t_min > t_max then
+	      (* Only one side explored, no basis to choose *)
 	      None
+	    else if !opt_target_guidance = 2.0 then
+	      if cur_heur <= 1 then
+		(* Don't apply guidance before we have any estimate
+		   of the value of this path *)
+		None
+	      (* Only prefer branches that lead to the best state(s)
+		 we've ever seen *)
+	      else if f_max = best_heur && f_max > t_max then
+		Some false
+	      else if t_max = best_heur && t_max > f_max then
+		Some true
+	      else
+		None
 	    else if f_max <> t_max then
 	      ( (*Printf.printf "Preference based on max\n"; *)
 	       Some (t_max > f_max))
@@ -746,6 +768,8 @@ class binary_decision_tree = object(self)
 	       Some (t_min > f_min)) *)
 	    else
 	      None
+      | (Some Some _, None) -> Some false
+      | (None, Some Some _) -> Some true
       | _ -> None
 
   method mark_all_seen =
